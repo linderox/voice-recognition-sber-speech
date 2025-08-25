@@ -1,5 +1,3 @@
-
-
 # -*- coding: utf-8 -*-
 """
 SmartSpeech (Sber) — Async gRPC клиент + анализ WAV и график эмоций.
