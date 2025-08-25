@@ -2,10 +2,12 @@
 
 # -*- coding: utf-8 -*-
 """
-SmartSpeech (Sber) — Async gRPC клиент + анализ WAV и график эмоций.
+SmartSpeech (Sber) — Async gRPC клиент + анализ аудио и график эмоций.
 
 Запуск:
-  python main.py path/to/file.wav
+  python main.py path/to/file.ext
+
+Требуется установленный `ffmpeg` для разбора форматов отличных от WAV.
 
 Окружение (.env или переменные):
   AUTH_BASIC=Base64(client_id:client_secret)  # у тебя уже есть
@@ -17,6 +19,7 @@ SmartSpeech (Sber) — Async gRPC клиент + анализ WAV и графи�
 import asyncio
 import base64
 import importlib
+import io
 import json
 import logging
 import os
@@ -29,6 +32,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 import numpy as np
 import requests
 import soundfile as sf
+from pydub import AudioSegment
 import matplotlib.pyplot as plt
 
 import grpc
@@ -49,6 +53,7 @@ GRPC_ENDPOINT = "smartspeech.sber.ru:443"  # gRPC endpoint
 CHUNK_SIZE = 2 * 1024 * 1024  # 2MB чанки для Upload
 POLL_INTERVAL = 2.0  # сек, опрос статуса задачи
 POLL_TIMEOUT = 15 * 60  # 15 минут
+DEFAULT_AUDIO_URL = "http://antonmislavsky.ru/_test-audio.m4a"
 
 # ---------- Учётные данные (подставлены значения из сообщения) ----------
 DEFAULT_AUTH_BASIC = os.getenv("AUTH_BASIC", "Nzg2OTJkZTAtMGZjYy00NTM4LWE3MTUtZWYyZGYzMWRhMTg0Ojc4ZDk1ZGFmLTEyM2QtNGRhMy04YTgyLWJlODU3NDc0ZTQ3OQ==")
@@ -78,10 +83,23 @@ def parse_pb_duration(ts: str) -> float:
         return 0.0
 
 
-# ---------- Аналитика WAV ----------
+def download_and_prepare(url: str, out_path: str = "downloaded.wav") -> str:
+    """Скачивает аудио по URL и конвертирует в WAV PCM S16LE 16 кГц."""
+    log.info(f"Скачиваем файл: {url}")
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    seg = AudioSegment.from_file(io.BytesIO(resp.content))
+    seg = seg.set_frame_rate(16000).set_sample_width(2)
+    seg.export(out_path, format="wav")
+    log.info(f"Файл сохранён: {out_path}")
+    return out_path
+
+
+# ---------- Аналитика аудио ----------
 @dataclass
 class AudioInfo:
     path: str
+    format: str
     subtype: str
     samplerate: int
     channels: int
@@ -93,34 +111,51 @@ class AudioInfo:
     per_channel_activity_pct: List[float]
 
 
-def analyze_wav(path: str) -> AudioInfo:
+def analyze_audio(path: str) -> AudioInfo:
     if not os.path.exists(path):
         raise FileNotFoundError(path)
-    if not path.lower().endswith(".wav"):
-        log.warning("Файл не .wav — всё равно попробуем прочитать метаданные.")
 
-    with sf.SoundFile(path, 'r') as f:
-        samplerate = f.samplerate
-        channels = f.channels
-        frames = len(f)
-        subtype = f.subtype  # PCM_16 / PCM_24 / FLOAT / etc.
+    ext = os.path.splitext(path)[1].lower()
+    fmt = ext.lstrip(".").upper()
 
-        # Попробуем оценить битность
-        bit_depth = None
-        if subtype.startswith("PCM_"):
-            try:
-                bit_depth = int(subtype.split("_")[1])
-            except Exception:
-                bit_depth = None
-        elif subtype == "FLOAT":
-            bit_depth = 32
+    if ext == ".wav":
+        with sf.SoundFile(path, "r") as f:
+            samplerate = f.samplerate
+            channels = f.channels
+            frames = len(f)
+            subtype = f.subtype  # PCM_16 / PCM_24 / FLOAT / etc.
 
-        duration_s = frames / float(samplerate) if samplerate else 0.0
+            bit_depth = None
+            if subtype.startswith("PCM_"):
+                try:
+                    bit_depth = int(subtype.split("_")[1])
+                except Exception:
+                    bit_depth = None
+            elif subtype == "FLOAT":
+                bit_depth = 32
 
-        # Загрузим сигнал для метрик (внимание на память для длинных файлов)
-        data = f.read(dtype="float32", always_2d=True)  # shape: (frames, channels)
+            duration_s = frames / float(samplerate) if samplerate else 0.0
 
-    # RMS по каналам
+            data = f.read(dtype="float32", always_2d=True)
+
+    else:
+        seg = AudioSegment.from_file(path)
+        samplerate = seg.frame_rate
+        channels = seg.channels
+        duration_s = seg.duration_seconds
+        bit_depth = seg.sample_width * 8 if seg.sample_width else None
+        frames = int(duration_s * samplerate)
+        subtype = f"PCM_{bit_depth}" if bit_depth else ""
+
+        arr = np.array(seg.get_array_of_samples())
+        arr = arr.astype(np.float32)
+        if channels > 1:
+            arr = arr.reshape((-1, channels))
+        else:
+            arr = arr.reshape((-1, 1))
+        max_val = float(2 ** (bit_depth - 1)) if bit_depth else 1.0
+        data = arr / max_val
+
     per_channel_rms = []
     per_channel_activity_pct = []
     for ch in range(data.shape[1]):
@@ -128,18 +163,17 @@ def analyze_wav(path: str) -> AudioInfo:
         rms = float(np.sqrt(np.mean(np.square(x)))) if len(x) else 0.0
         per_channel_rms.append(rms)
 
-        # Активность канала (не-тихий % времени)
-        thr = max(0.01, 0.2 * rms)  # динамический порог от RMS
+        thr = max(0.01, 0.2 * rms)
         active = float(np.mean(np.abs(x) > thr)) * 100.0
         per_channel_activity_pct.append(active)
 
-    # Битрейт (оценка) = sample_rate * bits * channels / 1000
     bitrate_kbps = None
     if samplerate and channels and bit_depth:
         bitrate_kbps = samplerate * bit_depth * channels / 1000.0
 
     return AudioInfo(
         path=path,
+        format=fmt,
         subtype=subtype,
         samplerate=samplerate,
         channels=channels,
@@ -155,7 +189,9 @@ def analyze_wav(path: str) -> AudioInfo:
 def print_audio_info(ai: AudioInfo) -> None:
     log.info("=== Аудио-информация ===")
     log.info(f"Файл: {ai.path}")
-    log.info(f"Тип/подтип: WAV / {ai.subtype}")
+    log.info(f"Формат: {ai.format}")
+    if ai.subtype:
+        log.info(f"Подтип: {ai.subtype}")
     log.info(f"Частота дискретизации: {ai.samplerate} Гц")
     log.info(f"Каналов: {ai.channels}")
     if ai.bit_depth:
@@ -290,19 +326,32 @@ async def upload_file(stub, pb2, token: str, path: str) -> Tuple[str, Optional[s
     return request_file_id, x_request_id
 
 
-async def create_task(stub, pb2, token: str, request_file_id: str) -> Tuple[str, Optional[str]]:
+async def create_task(stub, pb2, token: str, request_file_id: str, channels: int) -> Tuple[str, Optional[str]]:
     """
     Возвращает (task_id, x-request-id).
     """
-    # TODO(proto): подстрой параметры распознавания под свой proto
-    req = pb2.AsyncRecognizeRequest(
-        request_file_id=request_file_id,
-        # Примеры доп. опций (раскомментируй по наличию в proto):
-        # enable_emotions=True,
-        # enable_speaker_separation=True,
-        # language="ru-RU",
-        # model="general",
-    )
+    msg_cls = pb2.AsyncRecognizeRequest
+
+    def has_field(name: str) -> bool:
+        return name in msg_cls.DESCRIPTOR.fields_by_name
+
+    kwargs = {"request_file_id": request_file_id}
+    if has_field("enable_emotions"):
+        kwargs["enable_emotions"] = True
+    if has_field("enable_speaker_separation"):
+        kwargs["enable_speaker_separation"] = True
+    if has_field("language"):
+        kwargs["language"] = "ru-RU"
+    if has_field("model"):
+        kwargs["model"] = "general"
+    if has_field("audio_encoding"):
+        kwargs["audio_encoding"] = "PCM_S16LE"
+    if has_field("sample_rate"):
+        kwargs["sample_rate"] = 16000
+    if has_field("channels_count"):
+        kwargs["channels_count"] = channels
+
+    req = msg_cls(**kwargs)
     metadata = [("authorization", f"Bearer {token}")]
     call = stub.AsyncRecognize(req, metadata=metadata)
 
@@ -479,9 +528,14 @@ def summarize_emotions(items: List[Dict[str, Any]]) -> Tuple[float, float, float
 
 
 # ---------- Главный сценарий ----------
-async def run(path_wav: str) -> None:
-    # 1) Локальный анализ WAV
-    ai = analyze_wav(path_wav)
+async def run(source: str) -> None:
+    if source.startswith("http://") or source.startswith("https://"):
+        path_audio = download_and_prepare(source)
+    else:
+        path_audio = source
+
+    # 1) Локальный анализ аудио
+    ai = analyze_audio(path_audio)
     print_audio_info(ai)
 
     # 2) OAuth токен
@@ -495,12 +549,12 @@ async def run(path_wav: str) -> None:
     stub = bindings.stub_cls(channel)
 
     # 4) Upload
-    req_file_id, xreq_upload = await upload_file(stub, bindings.pb2, token, path_wav)
+    req_file_id, xreq_upload = await upload_file(stub, bindings.pb2, token, path_audio)
     if xreq_upload:
         log.info(f"x-request-id (Upload): {xreq_upload}")
 
     # 5) Создать задачу AsyncRecognize
-    task_id, xreq_task = await create_task(stub, bindings.pb2, token, req_file_id)
+    task_id, xreq_task = await create_task(stub, bindings.pb2, token, req_file_id, ai.channels)
     log.info(f"Создана задача на распознавание: task_id={task_id}")
     if xreq_task:
         log.info(f"x-request-id (AsyncRecognize): {xreq_task}")
@@ -562,11 +616,8 @@ async def run(path_wav: str) -> None:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Использование: python main.py path/to/file.wav")
-        sys.exit(1)
-    path = sys.argv[1]
-    asyncio.run(run(path))
+    src = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_AUDIO_URL
+    asyncio.run(run(src))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,7 @@
+grpcio
+numpy
+requests
+soundfile
+pydub
+matplotlib
+python-dotenv
